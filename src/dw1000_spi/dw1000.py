@@ -1,7 +1,7 @@
 import spidev 
 import logging
 import time 
-from typing import Literal
+from typing import Literal, overload
 
 # Library logger. Without any configuration, Python shows only WARNING and above (on stderr).
 # Apps can opt in to more with e.g. logging.basicConfig(level=logging.INFO), or use verbose=True.
@@ -14,7 +14,7 @@ def _enable_console_logging()->None:
     if not any(getattr(h, "_dw1000_console", False) for h in _PKG_LOGGER.handlers):
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("[DW1000] %(levelname)s: %(message)s"))
-        handler._dw1000_console = True
+        setattr(handler, "_dw1000_console", True)  # marker so we never add it twice
         _PKG_LOGGER.addHandler(handler)
     if _PKG_LOGGER.level == logging.NOTSET or _PKG_LOGGER.level > logging.INFO:
         _PKG_LOGGER.setLevel(logging.INFO)
@@ -134,7 +134,10 @@ class DW1000:
             - Checks that the device properly turned on & communicates
             - Verifies that the clock PLL locked 
             - Loads LDE microcode
-            - Sets comm speed to 20MHz 
+            - Sets comm speed to 20MHz
+
+        RAISES:
+            - RuntimeError if the device ID is wrong or the PLL did not lock / INIT was not reached.
         """
         ## Checking device ID is expected for DW1000 
         d_id = self.read_register([0x00], 4, reverse=True)
@@ -142,10 +145,10 @@ class DW1000:
             raise RuntimeError(f"Could not validate DW1000 connection: wrong device ID, expected ['0xde', '0xca', '0x1', '0x30'], got {d_id}. Is it plugged in correctly?")
         
         ## Checking CLK PLL locked and device completed INIT mode 
-        cfg = self.read_register([0x0F], 5) 
-        cplock = self.hex_to_octet(cfg[0])[6] # 2nd bit of 0th octet
-        slp2init = self.hex_to_octet(cfg[2])[0] # last bit of 2nd octet
-        if not (cplock and slp2init): 
+        cfg = self.read_register([0x0F], 5, return_ints=True) # SYS_STATUS
+        cplock = (cfg[0] >> 1) & 1    # CPLOCK: bit 1 of SYS_STATUS (bit 1 of octet 0)
+        slp2init = (cfg[2] >> 7) & 1  # SLP2INIT: bit 23 of SYS_STATUS (bit 7 of octet 2)
+        if not (cplock and slp2init):
             raise RuntimeError("Could not validate DW1000 connection: CLK PLL did not lock and/or INIT not reached. Try replugging it?")
 
         ## Loading LDE microcode as per steps in p.22 of user manual 
@@ -190,24 +193,27 @@ class DW1000:
         except Exception: 
             pass 
 
-    @staticmethod
-    def hex_to_octet(hex_str:str)->str: 
-        """ 
-        Converts a hex string into the equivalent octet binary string 
+    @overload
+    def read_register(self, header:list[int], length:int, reverse:bool=..., return_ints:Literal[False]=...)->list[str]: ...
+    @overload
+    def read_register(self, header:list[int], length:int, reverse:bool=..., *, return_ints:Literal[True])->list[int]: ...
+    @overload
+    def read_register(self, header:list[int], length:int, reverse:bool=..., return_ints:bool=...)->list[int]|list[str]: ...
+
+    def read_register(self, header:list[int], length:int, reverse:bool=False, return_ints:bool=False)->list[int]|list[str]:
         """
-        return f"{int(hex_str, base=16):08b}"
-    
-    def read_register(self, header:list, length:int, reverse:bool=False, return_ints:bool=False)->list[str|int]: 
-        """
-        Reads the value of a register. WARNING: Does not check validity of transaction.
+        Reads the value of a register. Checks argument types, but NOT that the register address,
+        sub-address or length are valid for the DW1000.
 
         ARGS: 
             - header: 1 to 3 octet header of the transaction in list format
             - length: Size of register in octets
             - reverse: Reverse output. By default, read is done LSB first as specified in DW1000 user manual.  
             - return_ints: Return int values instead of hex strings
-        RETURNS: 
-            - List of values read from the register. 
+        RETURNS:
+            - List of values read from the register (ints if return_ints, else hex strings like '0x1f').
+        RAISES:
+            - TypeError if header is not a list, length not an int or reverse not a bool.
         """
         if not isinstance(header, list) or not isinstance(length, int) or not isinstance(reverse, bool): 
             raise TypeError("read_register: header must be a list, length an int and reverse a bool")
@@ -216,67 +222,94 @@ class DW1000:
         if reverse: response.reverse() 
         return response if return_ints else [hex(octet) for octet in response]
     
-    def write_register(self, header:list, data:list)->None: 
+    def write_register(self, header:list[int], data:list[int])->None:
         """
-        Writes values to a register. WARNING: Does not check validity of transaction.
+        Writes values to a register. Checks argument types, but NOT that the register address,
+        sub-address or data length are valid for the DW1000.
 
-        ARGS: 
+        ARGS:
             - header: 1 to 3 octet header of the transaction in list format
             - data: List of octets to write to the register (LSB first)
+        RAISES:
+            - TypeError if header is not a list or data is not a non-empty list of ints.
         """
         if not isinstance(header, list) or not isinstance(data, list) or not data or not all(isinstance(b, int) for b in data): 
             raise TypeError("write_register: header must be a list and data a non-empty list of ints")
         self.spi.xfer2(header + data) 
 
-    def soft_reset(self, rx_only:bool=False): 
+    def soft_reset(self, rx_only:bool=False)->None:
         """
-        Performs a soft reset of the IC with the SOFTRESET register, as specified by the user manual. 
-        Will reset the IC TX, RX, Host Interface and the PMSC. 
-        
+        Performs a soft reset of the IC with the SOFTRESET bits of PMSC_CTRL0 (0x36:00), as specified by the user manual.
+
         ARGS:
-            - rx_only: Whether or not to only reset the rx components 
-        """   
-        # Getting the initial configuration to ensure we don't overwrite bits 
+            - rx_only:
+                - False (default): full reset of TX, RX, host interface and PMSC. Slow (~10ms), re-runs the
+                  start-up checks and LDE microcode load. NOTE: register configuration may revert to defaults,
+                  so you may need to call config_uwb_settings() again afterwards.
+                - True: light RX-only reset (see _rx_reset()). Keeps clocks, SPI speed and configuration.
+        RAISES:
+            - RuntimeError (full reset only) if the device fails the start-up checks afterwards.
+        """
+        if rx_only:
+            self._rx_reset()
+            logger.debug("RX-only reset of DW1000 completed.")
+            return
+
+        # Getting the initial configuration to ensure we don't overwrite bits
         pmsc = self.read_register([0x76, 0x00], 4, return_ints=True) # should be smthing like: [0, 2, 48, 240]
-        # Since we are about to reset the device, lower the speed to init values 
+        # Since we are about to reset the device, lower the speed to init values
         self.spi.max_speed_hz = 3_000_000
-    
-        # Setting SYSCLKS to 01 
-        pmsc[0] = (pmsc[0] & 0b11111100) | 0x01 # turning first 2 bits to 0 and then 01 
-        self.write_register([0xF6, 0x00], pmsc) 
-        # Clearing SOFTRESET to all zeros (except if RX only reset: affects only bit 28) 
-        if rx_only: 
-            pmsc[3] = (pmsc[3] & 0xEF) | 0x00
-        else: 
-            pmsc[3] = (pmsc[3] & 0x0F) | 0x00
+
+        # Setting SYSCLKS to 01
+        pmsc[0] = (pmsc[0] & 0b11111100) | 0x01 # turning first 2 bits to 0 and then 01
         self.write_register([0xF6, 0x00], pmsc)
-        # Waiting a bit 
-        time.sleep(0.01) 
-        # Setting SOFTRESET to all ones (except if RX only reset: affects only bit 28)
-        if rx_only: 
-            pmsc[3] = (pmsc[3] & 0xEF) | 0x10
-        else:
-            pmsc[3] = (pmsc[3] & 0x0F) | 0xF0
-        self.write_register([0xF6, 0x00], pmsc) 
+        # Clearing SOFTRESET (bits 28-31) to all zeros
+        pmsc[3] = pmsc[3] & 0x0F
+        self.write_register([0xF6, 0x00], pmsc)
+        # Waiting a bit
+        time.sleep(0.01)
+        # Setting SOFTRESET (bits 28-31) back to all ones
+        pmsc[3] = (pmsc[3] & 0x0F) | 0xF0
+        self.write_register([0xF6, 0x00], pmsc)
         # Setting SYSCLKS back to 00 (auto mode for reset)
         pmsc[0] = (pmsc[0] & 0b11111100) | 0x00
         self.write_register([0xF6, 0x00], pmsc) 
         
         # Reset done, run our init checks and set speed back to 20MHz
-        self.prep_device_for_use() 
+        self.prep_device_for_use()
         logger.info("Soft reset of DW1000 completed.")
 
-    def transmit(self, data:list, ranging:bool, timeout:float=0.05)->bool|tuple[bool, int|None]: 
+    def _rx_reset(self)->None:
         """
-        Transmits a message with the DW1000. Returns bool on whether was successfully sent. 
+        Light RX-only reset: pulses the RX reset bit (bit 28 of PMSC_CTRL0, i.e. bit 4 of octet 3) low then high.
+        Same sequence as Decawave's own driver (dwt_rxreset): no clock switch, no SPI speed change and no delay
+        are needed, and the UWB configuration and LDE microcode are kept. Only octet 3 of PMSC_CTRL0 is touched.
+        """
+        softreset = self.read_register([0x76, 0x03], 1, return_ints=True)[0]  # PMSC_CTRL0 octet 3 (bits 24-31)
+        self.write_register([0xF6, 0x03], [softreset & ~0x10 & 0xFF])         # bit 28 low: RX held in reset
+        self.write_register([0xF6, 0x03], [softreset | 0x10])                 # bit 28 high: RX released
 
-        ARGS: 
-            - data: List of bytes to send (LSB first) 
+    @overload
+    def transmit(self, data:list[int], ranging:Literal[False], timeout:float=...)->bool: ...
+    @overload
+    def transmit(self, data:list[int], ranging:Literal[True], timeout:float=...)->tuple[bool, int|None]: ...
+    @overload
+    def transmit(self, data:list[int], ranging:bool, timeout:float=...)->bool|tuple[bool, int|None]: ...
+
+    def transmit(self, data:list[int], ranging:bool, timeout:float=0.05)->bool|tuple[bool, int|None]:
+        """
+        Transmits a message with the DW1000 and waits until it is sent (or the timeout expires).
+
+        ARGS:
+            - data: List of bytes to send (LSB first), at most 125 bytes (+2 CRC octets added by the chip)
             - ranging: Bool indicating if ranging type of message
-            - timeout: Max amount of time [s] to wait for confirmed send of message 
-        RETURNS: 
-            - bool indicating if operation successful 
-            - If ranging True, also returns TX timestamp (reg 0x17) IN CLK TICKS (raw 40bit value) 
+            - timeout: Max amount of time [s] to wait for confirmed send of message
+        RETURNS:
+            - ranging False: bool indicating if the frame was sent
+            - ranging True: (sent, tx_timestamp), tx_timestamp being the TX time (reg 0x17) IN CLK TICKS
+              (raw 40bit value), or None if the frame was not sent
+        RAISES:
+            - ValueError if data is longer than 125 bytes (extended frames are not supported)
         """
         tx_timestamp = None
         txfrs = 0
@@ -323,8 +356,9 @@ class DW1000:
        
         RETURNS: 
         - True if we did 
-        - False if we didn't 
-            - NOTE: DW1000 stays in RX mode in this case. Will soft-reset if an error occured and re-enable RX. 
+        - False if we didn't
+            - NOTE: DW1000 stays in RX mode in this case. If an RX error or timeout occurred, RX is reset
+              (light RX-only reset), the error bits are cleared and RX is re-enabled.
         """
         status = self.read_register([0x0F], 5, return_ints=True) # SYS_STATUS 0x0F 
         bits8_23 = status[1] | status[2]<<8 # putting it into 16bit format for ease of comparison 
@@ -338,24 +372,36 @@ class DW1000:
             err_or_to_mask = 0x04<<24 | 0x27<<16 | 0x90<<8 # aforementioned error/TO bits 
             bits8_31 = status[1]<<8 | status[2]<<16 | status[3]<<24
             if (bits8_31 & err_or_to_mask)!=0: # If any of these bits are 1, there's a problem 
-                logger.info("RX timeout or error during DW1000.listen(), soft-resetting RX")
-                self.write_register([0x8D], [0x40]) # disable RX 
-                self.soft_reset(rx_only=True)
-                # Re-enableing RX again, we'll keep looping if there's time left 
+                logger.info("RX timeout or error during DW1000.listen(), resetting RX")
+                self.disable_rx_tx()  # TRXOFF: back to IDLE
+                self._rx_reset()      # light RX-only reset
+                # SYS_STATUS bits are latched and cleared by writing 1s: clear the error/timeout bits we just
+                # handled, otherwise they stay set and every following poll would reset RX again
+                self.write_register([0x8F], [err_or_to_mask & 0xFF, (err_or_to_mask>>8) & 0xFF,
+                                             (err_or_to_mask>>16) & 0xFF, (err_or_to_mask>>24) & 0xFF])
+                # Re-enableing RX again, we'll keep looping if there's time left
                 self.enable_rx() 
             # If we didn't get anything, DW1000 stays in RX mode 
             return False 
 
-    def receive_packet(self, return_ints:bool=True)->tuple[list|None, int|None]: 
-        """ 
-        Reads the RX buffer. This should only be called if the packet_available() method returns True. 
+    @overload
+    def receive_packet(self, return_ints:Literal[True]=...)->tuple[list[int]|None, int|None]: ...
+    @overload
+    def receive_packet(self, return_ints:Literal[False])->tuple[list[str]|None, int|None]: ...
+    @overload
+    def receive_packet(self, return_ints:bool=...)->tuple[list[int]|list[str]|None, int|None]: ...
+
+    def receive_packet(self, return_ints:bool=True)->tuple[list[int]|list[str]|None, int|None]:
+        """
+        Reads the RX buffer. This should only be called if the packet_available() method returns True.
 
         ARGS:
-        - return_ints: List data format in ints or in hex strings 
+        - return_ints: List data format in ints or in hex strings
 
-        RETURNS: 
-        - List of data found in RX buffer
-        - Timestamp of RX reception in clock ticks (int of raw 40 bit value) 
+        RETURNS:
+        - List of data found in RX buffer (without the 2 CRC octets)
+        - Timestamp of RX reception in clock ticks (int of raw 40 bit value)
+        - (None, None) if an extended frame (>127 bytes, not supported) was received; the device is then soft-reset
         """
         # Getting RX timestamp 
         rx_time = self.read_register([0x15], 5, return_ints=True)
@@ -373,18 +419,31 @@ class DW1000:
         data = self.read_register([0x11], rxfle_rxflen, return_ints=return_ints)  
         return data, rx_stamp
 
-    def listen(self, ranging:bool=False, timeout:float=DW_LISTEN_TIMEOUT, return_ints:bool=True)->None|list|tuple[list|None, int|None]: 
+    @overload
+    def listen(self, ranging:Literal[False]=..., timeout:float=..., return_ints:Literal[True]=...)->list[int]|None: ...
+    @overload
+    def listen(self, ranging:Literal[False]=..., timeout:float=..., *, return_ints:Literal[False])->list[str]|None: ...
+    @overload
+    def listen(self, ranging:Literal[True], timeout:float=..., return_ints:Literal[True]=...)->tuple[list[int]|None, int|None]: ...
+    @overload
+    def listen(self, ranging:Literal[True], timeout:float=..., *, return_ints:Literal[False])->tuple[list[str]|None, int|None]: ...
+    @overload
+    def listen(self, ranging:bool=..., timeout:float=..., return_ints:bool=...)->list[int]|list[str]|None|tuple[list[int]|list[str]|None, int|None]: ...
+
+    def listen(self, ranging:bool=False, timeout:float=DW_LISTEN_TIMEOUT, return_ints:bool=True)->list[int]|list[str]|None|tuple[list[int]|list[str]|None, int|None]:
         """
-        Sets the DW1000 to RX mode and listens for messages. 
-        Returns the first message found, if any, and closes the connection. 
-        
-        ARGS: 
+        Sets the DW1000 to RX mode and listens for messages.
+        Returns the first message found, if any, then disables RX (the DW1000 goes back to IDLE; the SPI
+        connection stays open).
+
+        ARGS:
             - ranging: If we are ranging, will return the RX timestamp too (reg 0x15)
-            - timeout: Max amount of time [s] to stay listening 
+            - timeout: Max amount of time [s] to stay listening
             - return_ints: Whether to return in hex string format or pure ints
-        RETURNS: 
-            - The data received in a list of bytes 
-            - If ranging, the RX timestamp in CLK TICKS (raw 40bit value) 
+        RETURNS:
+            - ranging False: the data received as a list of bytes, or None if nothing was received in time
+            - ranging True: (data, rx_timestamp), rx_timestamp being in CLK TICKS (raw 40bit value);
+              (None, None) if nothing was received in time
         """
         data = None 
         rx_stamp = None 
@@ -460,7 +519,12 @@ class DW1000:
             - bitrate: Bitrate, 110kps, 850kps or 6.8Mbps (latter can be passed as 6, 7 or 6.8, all correspond to 6.8)
             - preamble_length: in symbols
             - smart_tx_power: bool (whether to use it or not), can only be used with 6.8Mbps bitrate
-            - tx_power_settings: ONLY USE IF SURE! 4 bytes in LSB order of 0x1E register, leave at None for default. 
+            - tx_power_settings: ONLY USE IF SURE! List of exactly 4 ints (0-255), the bytes of the 0x1E register
+              in LSB order, e.g. [0x67, 0x67, 0x67, 0x67] (NOT 0x67676767). Leave at None for the defaults.
+
+        RAISES:
+            - ValueError if the combination of settings is not supported, or if tx_power_settings is not a
+              list of 4 ints between 0 and 255. Nothing is written to the device in that case.
 
         Modifies the following registers:
             - 0x1F    - Channel Control
@@ -477,6 +541,7 @@ class DW1000:
             - 0x23:04 - AGC_TUNE1
             - 0x23:0C - AGC_TUNE2
             - 0x23:12 - AGC_TUNE3
+            - 0x2E:1806 - LDE_CFG2
             - 0x1E    - TX Power
             - 0x04    - System Configuration
         """
@@ -485,6 +550,10 @@ class DW1000:
             # and simplifies following if/elses 
             raise ValueError(f"Unsupported UWB config for DW1000: channel={channel}, PRF={PRF}, bitrate={bitrate}, "
                              f"preamble_length={preamble_length}, preamble_code={preamble_code}, smart_tx_power={smart_tx_power}")
+        if tx_power_settings is not None:
+            if (not isinstance(tx_power_settings, list) or len(tx_power_settings) != 4
+                    or not all(isinstance(b, int) and not isinstance(b, bool) and 0 <= b <= 0xFF for b in tx_power_settings)):
+                raise ValueError(f"tx_power_settings must be a list of 4 ints between 0 and 255 (0x1E register bytes, LSB first), got {tx_power_settings!r}")
         
         ###################### 0x1F - Channel Control ######################
         og_cfg = self.read_register([0x1F], 4, return_ints=True) 
@@ -684,10 +753,10 @@ class DW1000:
             self.write_register([0x84], new_cfg)
         ###################### 0x1E ######################
         tx_power = self.read_register([0x1E], 4, return_ints=True)
-        if tx_power_settings: 
-            # tx power settings must be a list in LSB order of the 4 bytes to write to 0x1E 
+        if tx_power_settings is not None:
+            # tx power settings (validated above) are the 4 bytes to write to 0x1E, LSB first
             # NOTE: ex: NOT 0x67676767 but [0x67, 0x67, 0x67, 0x67]
-            new_cfg = tx_power_settings 
+            new_cfg = tx_power_settings
         else: 
             if smart_tx_power: 
                 new_cfg = _SMART_TX_POWER_CONFIG[channel][PRF]
