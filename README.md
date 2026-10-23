@@ -26,3 +26,7 @@ ticks, convert to seconds with `DW1000.TIME_UNIT`.
 
 Always use the context manager so the SPI connection is closed properly.
 Only the standard SFD and standard (<=127 byte) frames are currently supported.
+
+Messages use the standard `logging` module (logger name `dw1000_spi`). By default only real warnings
+are shown (e.g. a transmit timeout). Pass `verbose=True` to `DW1000(...)` to also see status messages,
+or configure it yourself, e.g. `logging.getLogger("dw1000_spi").setLevel(logging.DEBUG)`.
