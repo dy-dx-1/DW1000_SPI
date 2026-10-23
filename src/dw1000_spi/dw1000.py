@@ -77,22 +77,36 @@ class DW1000:
     Communicates in SPI mode 0. 
     
     IMPORTANT: Use a context manager to ensure that the connection is properly closed. 
+
+    Raises RuntimeError if the chip does not answer correctly at start-up and ValueError if the UWB
+    settings are invalid. Pass verbose=True to print status / warning messages (silent by default).
     """
     TIME_UNIT = 1.5650040064102565e-11  # seconds / tick for the DW1000
     DW_LISTEN_TIMEOUT = 0.015           # Delay used to wait during RX 
 
     def __init__(self, bus:int, cs:int, channel:Literal[1,2,3,4,5,7], PRF:Literal[16,64], bitrate:Literal[110,850,6,7],
                  preamble_length:Literal[64,128,256,512,1024,1536,2048,4096], preamble_code:int, 
-                 smart_tx_power:bool, tx_power_settings:int|None=None): 
+                 smart_tx_power:bool, tx_power_settings:list[int]|None=None, verbose:bool=False): 
+        self.verbose = verbose            # If False, nothing is ever printed
+        self._closed = True               # Nothing to close until the port is opened
         self.spi = spidev.SpiDev() 
         self.spi.open(bus, cs) 
-        
-        self.spi.max_speed_hz = 3_000_000 # On init, should not exceed 3MHz  
-        self.spi.mode = 0b00              # GPIO 5 and 6 dictate the mode, should be untouched 
-        
-        self.prep_device_for_use()        # Checks that device initialized properly and sets clock to 20MHz
-        self.config_uwb_settings(channel, PRF, bitrate, preamble_length, preamble_code, smart_tx_power, tx_power_settings) # Checks validity of settings and applies them 
-        print("DW1000 DEVICE READY")
+        self._closed = False
+
+        try:
+            self.spi.max_speed_hz = 3_000_000 # On init, should not exceed 3MHz  
+            self.spi.mode = 0b00              # GPIO 5 and 6 dictate the mode, should be untouched 
+
+            self.prep_device_for_use()        # Checks that device initialized properly and sets clock to 20MHz
+            self.config_uwb_settings(channel, PRF, bitrate, preamble_length, preamble_code, smart_tx_power, tx_power_settings) # Checks validity of settings and applies them 
+        except BaseException:
+            # Don't leave the SPI port open if setup failed 
+            try:
+                self.close(verbose=False)
+            except Exception:
+                pass
+            raise
+        self._log("DW1000 DEVICE READY")
     
     def prep_device_for_use(self): 
         """
@@ -105,19 +119,14 @@ class DW1000:
         ## Checking device ID is expected for DW1000 
         d_id = self.read_register([0x00], 4, reverse=True)
         if d_id != ['0xde', '0xca', '0x1', '0x30']:
-            print("DW1000 did not return the correct ID. Is it plugged in correctly?")
-            print(f"Expected ID: ['0xde', '0xca', '0x1', '0x30'], got {d_id}")
-            self.close() 
-            raise RuntimeError("Could not validate DW1000 connection")
+            raise RuntimeError(f"Could not validate DW1000 connection: wrong device ID, expected ['0xde', '0xca', '0x1', '0x30'], got {d_id}. Is it plugged in correctly?")
         
         ## Checking CLK PLL locked and device completed INIT mode 
         cfg = self.read_register([0x0F], 5) 
         cplock = self.hex_to_octet(cfg[0])[6] # 2nd bit of 0th octet
         slp2init = self.hex_to_octet(cfg[2])[0] # last bit of 2nd octet
         if not (cplock and slp2init): 
-            print("[ERROR] DW1000 did not lock CLK PLL and/or did not reach INIT successfully. Try replugging it?")
-            self.close() 
-            raise RuntimeError("Could not validate DW1000 connection")
+            raise RuntimeError("Could not validate DW1000 connection: CLK PLL did not lock and/or INIT not reached. Try replugging it?")
 
         ## Loading LDE microcode as per steps in p.22 of user manual 
         self.write_register([0xF6, 0x00], [0x01, 0x03])
@@ -136,9 +145,22 @@ class DW1000:
         ## If we get here, DW1000 should be in IDLE state, set rate to maximum 
         self.spi.max_speed_hz = 20_000_000 # In IDLE state, can operate at 20MHz 
     
-    def close(self, verbose=True): 
-        self.write_register([0x8D], [0x40]) # turning off all RX / TX 
-        self.spi.close() 
+    def _log(self, msg:str)->None:
+        """ Prints msg only if the object was created with verbose=True """
+        if self.verbose:
+            print(msg)
+
+    def close(self, verbose:bool|None=None)->None: 
+        """ Closes the SPI connection (safe to call more than once). verbose=None uses the object's verbose setting. """
+        if self._closed: 
+            return 
+        self._closed = True
+        try: 
+            self.write_register([0x8D], [0x40]) # turning off all RX / TX 
+        finally: 
+            self.spi.close() 
+        if verbose is None: 
+            verbose = self.verbose
         if verbose: 
             print("DW1000 connection closed")
 
@@ -147,13 +169,12 @@ class DW1000:
 
     def __exit__(self, exc_type, exc_val, exc_tb): 
         self.close() 
-        print("DW1000 exited context manager successfully")
+        self._log("DW1000 exited context manager successfully")
 
     def __del__(self):
         try:
             self.close(verbose=False) 
-            print("__del__ called on dw1000 obj")
-        except: 
+        except Exception: 
             pass 
 
     @staticmethod
@@ -175,9 +196,8 @@ class DW1000:
         RETURNS: 
             - List of values read from the register. 
         """
-        if type(header) != list or type(length) != int or type(reverse) != bool: 
-            print("Unexpected type in read_register. Check your args.")
-            return None 
+        if not isinstance(header, list) or not isinstance(length, int) or not isinstance(reverse, bool): 
+            raise TypeError("read_register: header must be a list, length an int and reverse a bool")
         response = self.spi.xfer2(header + [0]*length) # xfer2 is supposed to keep CS pressed for the entire transaction, although some sources differ, I use it to be safe. At worst its equivalent to xfer 
         response = response[len(header):]              # throwing away the header
         if reverse: response.reverse() 
@@ -191,9 +211,8 @@ class DW1000:
             - header: 1 to 3 octet header of the transaction in list format
             - data: List of octets to write to the register (LSB first)
         """
-        if type(header) != list or type(data) != list or type(data[0]) != int:
-            print("Unexpected type in write_register. Check your args.")
-            return None 
+        if not isinstance(header, list) or not isinstance(data, list) or not data or not all(isinstance(b, int) for b in data): 
+            raise TypeError("write_register: header must be a list and data a non-empty list of ints")
         self.spi.xfer2(header + data) 
 
     def soft_reset(self, rx_only:bool=False): 
@@ -232,7 +251,7 @@ class DW1000:
         
         # Reset done, run our init checks and set speed back to 20MHz
         self.prep_device_for_use() 
-        print("Soft reset of DW1000 completed.")
+        self._log("Soft reset of DW1000 completed.")
 
     def transmit(self, data:list, ranging:bool, timeout:float=0.05)->bool|tuple[bool, int|None]: 
         """
@@ -247,14 +266,14 @@ class DW1000:
             - If ranging True, also returns TX timestamp (reg 0x17) IN CLK TICKS (raw 40bit value) 
         """
         tx_timestamp = None
+        txfrs = 0
+        # NOTE: currently not supporting extended data frames, messages shouldn't exceed 127 bytes 
+        if len(data) + 2 > 127: # +2 for the CRC octets
+            raise ValueError(f"DW1000.transmit(): {len(data)} data bytes + 2 CRC octets exceeds 127 bytes (extended frames not supported)")
         ### Writing data to TX buffer 
         self.write_register([0x89], data)
         ### Setting frame length in Transmit Frame Control 
         data_length = len(data) + 2 # adding 2 octets of CRC check 
-        # NOTE: currently not supporting extended data frames, messages shouldn't exceed 127 bytes 
-        if data_length>127: 
-            print("[WARNING] in DW1000.transmit(), data frame exceed 127bytes (TFLE!=0). Currently not supporting this, check the message?")
-            return 
         curr = self.read_register([0x08], 2, return_ints=True)
         tx_fctrl = data_length | ((curr[1] & 0x60)<<8)  # TFLEN == data_length, keeping TXBR and 0 TFLE and R 
         tx_fctrl |= int(ranging)<<15
@@ -272,7 +291,7 @@ class DW1000:
                 break # DW1000 will return to IDLE automatically 
         else: 
             # TODO Can add more in depth inspection of error bits in future 
-            print("Transmit timeout in DW1000.transmit(), returning to IDLE")
+            self._log("Transmit timeout in DW1000.transmit(), returning to IDLE")
             self.disable_rx_tx() # Force return to IDLE 
 
         return (bool(txfrs), tx_timestamp) if ranging else bool(txfrs)
@@ -306,7 +325,7 @@ class DW1000:
             err_or_to_mask = 0x04<<24 | 0x27<<16 | 0x90<<8 # aforementioned error/TO bits 
             bits8_31 = status[1]<<8 | status[2]<<16 | status[3]<<24
             if (bits8_31 & err_or_to_mask)!=0: # If any of these bits are 1, there's a problem 
-                print("RX timeout or error during DW1000.listen(), soft-resetting it")
+                self._log("RX timeout or error during DW1000.listen(), soft-resetting it")
                 self.write_register([0x8D], [0x40]) # disable RX 
                 self.soft_reset(rx_only=True)
                 # Re-enableing RX again, we'll keep looping if there's time left 
@@ -333,7 +352,7 @@ class DW1000:
         rxfle_rxflen = (rx_finfo[0] | (rx_finfo[1]<<8)) & 0x3FF
         # NOTE: currently not supporting non std operation, so RXFLE should be 0 
         if rxfle_rxflen>0x7F: # Currently, messages should be <= 127bytes 
-            print("[WARNING] in DW1000.receive_packet(), received extended data frame (RXFLE!=0). Currently not supporting this, check the message?")
+            self._log("[WARNING] in DW1000.receive_packet(), received extended data frame (RXFLE!=0). Currently not supporting this, check the message?")
             self.soft_reset()
             return None, None 
         # Now reading buffer with frame length 
@@ -367,7 +386,7 @@ class DW1000:
         return (data, rx_stamp) if ranging else data 
     
     @staticmethod
-    def check_valid_uwb_config(channel:int, PRF:int, bitrate:float, preamble_length:int, preamble_code:int, smart_tx_power:bool)->bool: 
+    def check_valid_uwb_config(channel:int, PRF:int, bitrate:float, preamble_length:int, preamble_code:int, smart_tx_power:bool, verbose:bool=False)->bool: 
         """ 
         Checks if a specific UWB configuration is valid based on the DW1000 user manual. 
         """
@@ -406,7 +425,7 @@ class DW1000:
         elif preamble_length==64 and bitrate!=110 and bitrate!=850: 
             pass # ok 
         else: 
-            print("Invalid bitrate-preamble config for DRX_TUNE1b")
+            if verbose: print("Invalid bitrate-preamble config for DRX_TUNE1b")
             return False 
         ## Smart TX Power can only be used with 6.8 bitrate
         if smart_tx_power: 
@@ -448,11 +467,11 @@ class DW1000:
             - 0x1E    - TX Power
             - 0x04    - System Configuration
         """
-        if not self.check_valid_uwb_config(channel, PRF, bitrate, preamble_length, preamble_code, smart_tx_power):
+        if not self.check_valid_uwb_config(channel, PRF, bitrate, preamble_length, preamble_code, smart_tx_power, self.verbose):
             # This ensures that the combination of values is valid 
             # and simplifies following if/elses 
-            print("Unsupported UWB config for DW1000, check DW1000.config_uwb_settings()")
-            return 
+            raise ValueError(f"Unsupported UWB config for DW1000: channel={channel}, PRF={PRF}, bitrate={bitrate}, "
+                             f"preamble_length={preamble_length}, preamble_code={preamble_code}, smart_tx_power={smart_tx_power}")
         
         ###################### 0x1F - Channel Control ######################
         og_cfg = self.read_register([0x1F], 4, return_ints=True) 
@@ -675,4 +694,4 @@ class DW1000:
         Smart TX Power: {smart_tx_power} 
         TX Power Settings (LSB first): {[hex(_) for _ in new_cfg]}
         **NOTE**: Settings currently only support standard SFD.""" 
-        print(to_print)
+        self._log(to_print)
