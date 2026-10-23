@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dw1000-spi"
-version = "0.1.0"
+dynamic = ["version"]   # read from src/dw1000_spi/__init__.py
 description = "SPI driver for the Decawave DW1000 UWB transceiver (TX/RX, ranging timestamps, UWB configuration)"
 readme = "README.md"
 requires-python = ">=3.10"   # the code uses `int | None` annotations
@@ -16,6 +16,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: POSIX :: Linux",
     "Topic :: System :: Hardware",
+    "Typing :: Typed",
 ]
 dependencies = [
     "spidev; sys_platform == 'linux'",
@@ -29,3 +30,6 @@ Homepage = "https://github.com/dy-dx-1/DW1000_SPI"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dw1000_spi"]
+
+[tool.hatch.version]
+path = "src/dw1000_spi/__init__.py"
