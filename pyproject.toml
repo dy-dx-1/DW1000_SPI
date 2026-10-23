@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dw1000-spi"
+version = "0.1.0"
+description = "SPI driver for the Decawave DW1000 UWB transceiver (TX/RX, ranging timestamps, UWB configuration)"
+readme = "README.md"
+requires-python = ">=3.10"   # the code uses `int | None` annotations
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Nicolas Sarabia" }]
+keywords = ["dw1000", "uwb", "ultra-wideband", "spi", "ranging", "raspberry-pi"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: System :: Hardware",
+]
+dependencies = [
+    "spidev; sys_platform == 'linux'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "build", "twine"]
+
+# [project.urls]
+# Homepage = "https://github.com/<you>/DW1000_SPI"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dw1000_spi"]
