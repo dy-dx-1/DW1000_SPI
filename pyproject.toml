@@ -24,8 +24,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest", "build", "twine"]
 
-# [project.urls]
-# Homepage = "https://github.com/<you>/DW1000_SPI"
+[project.urls]
+Homepage = "https://github.com/dy-dx-1/DW1000_SPI"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dw1000_spi"]
