@@ -88,7 +88,16 @@ _SMART_TX_POWER_CONFIG = {
     7: {16: [0x92, 0x72, 0x52, 0x32], 64: [0xD1, 0xB1, 0x71, 0x51]},
 }
 
-class DW1000: 
+# LDE replica coefficient (sub-register 0x2E:2804 LDE_REPC) per RX preamble code.
+# User manual Table 47 (values for 850 kbps & 6.8 Mbps; divide by 8 at 110 kbps).
+_LDE_REPC = {
+    1: 0x5998,  2: 0x5998,  3: 0x51EA,  4: 0x428E,  5: 0x451E,  6: 0x2E14,
+    7: 0x8000,  8: 0x51EA,  9: 0x28F4, 10: 0x3332, 11: 0x3AE0, 12: 0x3D70,
+   13: 0x3AE0, 14: 0x35C2, 15: 0x2B84, 16: 0x35C2, 17: 0x3332, 18: 0x35C2,
+   19: 0x35C2, 20: 0x47AE, 21: 0x3AE0, 22: 0x3850, 23: 0x30A2, 24: 0x3850,
+}
+
+class DW1000:
     """
     Class defining interactions with the Decawave DW1000 UWB chip through SPI.
     Communicates in SPI mode 0. 
@@ -108,6 +117,7 @@ class DW1000:
         self.verbose = verbose
         if verbose:
             _enable_console_logging()  # show INFO messages on the console
+        self._uwb_config:dict|None = None  # Last applied UWB settings, re-applied after a full soft reset
         self._closed = True               # Nothing to close until the port is opened
         self.spi = spidev.SpiDev() 
         self.spi.open(bus, cs) 
@@ -131,25 +141,28 @@ class DW1000:
     def prep_device_for_use(self): 
         """
         After a reset:
-            - Checks that the device properly turned on & communicates
-            - Verifies that the clock PLL locked 
-            - Loads LDE microcode
+            - Checks that the device properly turned on & communicates (device ID)
+            - Checks the clock PLL lock (CPLOCK) and SLEEP-to-INIT (SLP2INIT) status flags. Only logs a warning:
+              the manual (SYS_STATUS, p.83) says the CPLOCK flag "may not be reliable and is only used for debug
+              purposes", so it should not be treated as a hard failure.
+            - Loads LDE microcode (Table 4, p.22 of user manual)
             - Sets comm speed to 20MHz
 
         RAISES:
-            - RuntimeError if the device ID is wrong or the PLL did not lock / INIT was not reached.
+            - RuntimeError if the device ID is wrong (wiring / SPI problem).
         """
         ## Checking device ID is expected for DW1000 
         d_id = self.read_register([0x00], 4, reverse=True)
         if d_id != ['0xde', '0xca', '0x1', '0x30']:
             raise RuntimeError(f"Could not validate DW1000 connection: wrong device ID, expected ['0xde', '0xca', '0x1', '0x30'], got {d_id}. Is it plugged in correctly?")
         
-        ## Checking CLK PLL locked and device completed INIT mode 
+        ## Checking CLK PLL locked and device completed INIT mode (debug-level flags, see docstring)
         cfg = self.read_register([0x0F], 5, return_ints=True) # SYS_STATUS
         cplock = (cfg[0] >> 1) & 1    # CPLOCK: bit 1 of SYS_STATUS (bit 1 of octet 0)
         slp2init = (cfg[2] >> 7) & 1  # SLP2INIT: bit 23 of SYS_STATUS (bit 7 of octet 2)
         if not (cplock and slp2init):
-            raise RuntimeError("Could not validate DW1000 connection: CLK PLL did not lock and/or INIT not reached. Try replugging it?")
+            logger.warning(f"DW1000 status flags not set after start-up (CPLOCK={cplock}, SLP2INIT={slp2init}). "
+                           "These flags are not fully reliable, but if communication fails, try replugging the device.")
 
         ## Loading LDE microcode as per steps in p.22 of user manual 
         self.write_register([0xF6, 0x00], [0x01, 0x03])
@@ -239,16 +252,19 @@ class DW1000:
 
     def soft_reset(self, rx_only:bool=False)->None:
         """
-        Performs a soft reset of the IC with the SOFTRESET bits of PMSC_CTRL0 (0x36:00), as specified by the user manual.
+        Performs a soft reset of the IC with the SOFTRESET bits of PMSC_CTRL0 (0x36:00), as specified by the
+        user manual (PMSC_CTRL0 SOFTRESET field, p.179).
 
         ARGS:
             - rx_only:
-                - False (default): full reset of TX, RX, host interface and PMSC. Slow (~10ms), re-runs the
-                  start-up checks and LDE microcode load. NOTE: register configuration may revert to defaults,
-                  so you may need to call config_uwb_settings() again afterwards.
+                - False (default): full reset of TX, RX, host interface and PMSC ("essentially a reset of the IC").
+                  The device goes back through INIT, where register configurations are only restored from the AON
+                  memory if that was set up (p.15), which this driver does not do. So after the reset, the start-up
+                  checks and LDE microcode load are re-run, and the last UWB configuration passed to
+                  config_uwb_settings() is re-applied automatically. Slow (~10ms + reconfiguration).
                 - True: light RX-only reset (see _rx_reset()). Keeps clocks, SPI speed and configuration.
         RAISES:
-            - RuntimeError (full reset only) if the device fails the start-up checks afterwards.
+            - RuntimeError (full reset only) if the device ID check fails afterwards.
         """
         if rx_only:
             self._rx_reset()
@@ -277,13 +293,19 @@ class DW1000:
         
         # Reset done, run our init checks and set speed back to 20MHz
         self.prep_device_for_use()
+        # Configuration registers are back to their defaults: re-apply the last UWB configuration
+        if self._uwb_config is not None:
+            self.config_uwb_settings(**self._uwb_config)
         logger.info("Soft reset of DW1000 completed.")
 
     def _rx_reset(self)->None:
         """
         Light RX-only reset: pulses the RX reset bit (bit 28 of PMSC_CTRL0, i.e. bit 4 of octet 3) low then high.
-        Same sequence as Decawave's own driver (dwt_rxreset): no clock switch, no SPI speed change and no delay
-        are needed, and the UWB configuration and LDE microcode are kept. Only octet 3 of PMSC_CTRL0 is touched.
+        As per the manual (PMSC_CTRL0 SOFTRESET field, p.179): "To apply a receiver-only soft reset, clear and
+        set bit 28 only." No clock switch, SPI speed change or delay is needed, and the UWB configuration and LDE
+        microcode are kept. Only octet 3 of PMSC_CTRL0 is touched.
+        The manual (note p.31) requires this reset after any RX error or timeout event (RXPTO, RXSFDTO, RXPHE,
+        RXRFSL, RXRFTO, ...) so that the next good frame gets a correctly calculated timestamp.
         """
         softreset = self.read_register([0x76, 0x03], 1, return_ints=True)[0]  # PMSC_CTRL0 octet 3 (bits 24-31)
         self.write_register([0xF6, 0x03], [softreset & ~0x10 & 0xFF])         # bit 28 low: RX held in reset
@@ -347,7 +369,12 @@ class DW1000:
         self.write_register([0x8D], [0x40])
 
     def enable_rx(self): 
-        """ Enable RX (SYS_CTRL 0x0D) """ 
+        """
+        Enable RX (RXENAB in SYS_CTRL 0x0D).
+        Per the SYS_STATUS bit descriptions (p.83-88), every RX event/error bit (RXPRD, RXSFDD, LDEDONE, RXPHD,
+        RXPHE, RXDFR, RXFCG, RXFCE, RXRFSL, RXRFTO, LDEERR, RXPTO, RXSFDTO, ...) is "automatically cleared by the
+        next receiver enable", so no explicit clearing of SYS_STATUS is needed before listening.
+        """
         self.write_register([0x8D], [0, 1]) 
 
     def packet_available(self)->bool: 
@@ -358,7 +385,7 @@ class DW1000:
         - True if we did 
         - False if we didn't
             - NOTE: DW1000 stays in RX mode in this case. If an RX error or timeout occurred, RX is reset
-              (light RX-only reset), the error bits are cleared and RX is re-enabled.
+              (light RX-only reset, required by the manual p.31) and re-enabled, which clears the error bits.
         """
         status = self.read_register([0x0F], 5, return_ints=True) # SYS_STATUS 0x0F 
         bits8_23 = status[1] | status[2]<<8 # putting it into 16bit format for ease of comparison 
@@ -375,12 +402,9 @@ class DW1000:
                 logger.info("RX timeout or error during DW1000.listen(), resetting RX")
                 self.disable_rx_tx()  # TRXOFF: back to IDLE
                 self._rx_reset()      # light RX-only reset
-                # SYS_STATUS bits are latched and cleared by writing 1s: clear the error/timeout bits we just
-                # handled, otherwise they stay set and every following poll would reset RX again
-                self.write_register([0x8F], [err_or_to_mask & 0xFF, (err_or_to_mask>>8) & 0xFF,
-                                             (err_or_to_mask>>16) & 0xFF, (err_or_to_mask>>24) & 0xFF])
-                # Re-enableing RX again, we'll keep looping if there's time left
-                self.enable_rx() 
+                # Re-enabling RX again, we'll keep looping if there's time left.
+                # This also clears the latched RX status/error bits (see enable_rx()).
+                self.enable_rx()
             # If we didn't get anything, DW1000 stays in RX mode 
             return False 
 
@@ -401,7 +425,8 @@ class DW1000:
         RETURNS:
         - List of data found in RX buffer (without the 2 CRC octets)
         - Timestamp of RX reception in clock ticks (int of raw 40 bit value)
-        - (None, None) if an extended frame (>127 bytes, not supported) was received; the device is then soft-reset
+        - (None, None) if an extended frame (>127 bytes, not supported) was received; the device is then fully
+          soft-reset (UWB configuration is re-applied automatically, see soft_reset())
         """
         # Getting RX timestamp 
         rx_time = self.read_register([0x15], 5, return_ints=True)
@@ -542,8 +567,16 @@ class DW1000:
             - 0x23:0C - AGC_TUNE2
             - 0x23:12 - AGC_TUNE3
             - 0x2E:1806 - LDE_CFG2
+            - 0x2E:2804 - LDE_REPC (depends on preamble code, divided by 8 at 110 kbps)
+            - 0x27:26 - DRX_TUNE4H (depends on preamble length)
             - 0x1E    - TX Power
             - 0x04    - System Configuration
+
+        Not modified: 0x2E:0806 LDE_CFG1 is left at its default NSTDEV of 12. The manual (p.22 and p.165) says
+        13 can give more accuracy in close-up line-of-sight conditions, while 12 may be better where
+        non-line-of-sight performance matters.
+
+        The settings are remembered and re-applied automatically after a full soft_reset().
         """
         if not self.check_valid_uwb_config(channel, PRF, bitrate, preamble_length, preamble_code, smart_tx_power):
             # This ensures that the combination of values is valid 
@@ -738,6 +771,24 @@ class DW1000:
             new_cfg = [0x07, 0x06] 
         if lde!=new_cfg:
             self.write_register([0xEE, 0x86, 0x30], new_cfg)
+        ###################### 0x2E:2804 - LDE_REPC ####################
+        # Replica avoidance coefficient, depends on the RX preamble code (manual Table 47, p.167).
+        # Values in the table are for 850 kbps and 6.8 Mbps; at 110 kbps they must be divided by 8.
+        # 3 octet header: 0x84 = 0x80|(0x2804&0x7F) and 0x50 = 0x2804>>7
+        repc = _LDE_REPC[preamble_code]
+        if bitrate == 110:
+            repc >>= 3
+        lde_repc = self.read_register([0x6E, 0x84, 0x50], 2, return_ints=True)
+        new_cfg = [repc & 0xFF, (repc>>8) & 0xFF]
+        if lde_repc!=new_cfg:
+            self.write_register([0xEE, 0x84, 0x50], new_cfg)
+        ###################### 0x27:26 - DRX_TUNE4H ####################
+        # Depends on the expected preamble length (manual Table 31, p.136): 0x0010 for 64 symbols,
+        # 0x0028 for 128 symbols or more. The manual warns not to write any other value to this register.
+        tune4h = self.read_register([0x67, 0x26], 2, return_ints=True)
+        new_cfg = [0x10, 0x00] if preamble_length == 64 else [0x28, 0x00]
+        if tune4h!=new_cfg:
+            self.write_register([0xE7, 0x26], new_cfg)
         ###################### 0x04 ######################
         sys_cfg = self.read_register([0x04], 4, return_ints=True) 
         sys_cfg = sys_cfg[0] | sys_cfg[1]<<8 | sys_cfg[2]<<16 | sys_cfg[3]<<24
@@ -775,5 +826,9 @@ class DW1000:
         PAC size: {PAC_size}
         Smart TX Power: {smart_tx_power} 
         TX Power Settings (LSB first): {[hex(_) for _ in new_cfg]}
-        **NOTE**: Settings currently only support standard SFD.""" 
+        **NOTE**: Settings currently only support standard SFD."""
         logger.info(to_print)
+        # Remember the settings so a full soft_reset() can re-apply them
+        self._uwb_config = dict(channel=channel, PRF=PRF, bitrate=bitrate, preamble_length=preamble_length,
+                                preamble_code=preamble_code, smart_tx_power=smart_tx_power,
+                                tx_power_settings=tx_power_settings)
