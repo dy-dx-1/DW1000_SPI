@@ -97,6 +97,15 @@ _LDE_REPC = {
    19: 0x35C2, 20: 0x47AE, 21: 0x3AE0, 22: 0x3850, 23: 0x30A2, 24: 0x3850,
 }
 
+# Air-time constants used by DW1000.frame_duration()
+# Preamble symbol duration [s] per PRF (user manual Table 56, p.201)
+_PREAMBLE_SYMBOL_S = {16: 993.59e-9, 64: 1017.63e-9}
+# Duration of one data bit [s] per bitrate (IEEE 802.15.4 UWB PHY: 110 kbps, 850 kbps, 6.8 Mbps)
+_DATA_BIT_S = {110: 8205.13e-9, 850: 1025.64e-9, 6.8: 128.21e-9}
+_PHR_BITS = 19            # PHY header length, incl. 6-bit SECDED (manual §10.4)
+_RS_BLOCK_BITS = 330      # Reed-Solomon: 48 parity bits per block of up to 330 data bits
+_RS_PARITY_BITS = 48
+
 class DW1000:
     """
     Class defining interactions with the Decawave DW1000 UWB chip through SPI.
@@ -109,7 +118,20 @@ class DW1000:
     verbose=True also prints status messages to the console.
     """
     TIME_UNIT = 1.5650040064102565e-11  # seconds / tick for the DW1000
-    DW_LISTEN_TIMEOUT = 0.015           # Delay used to wait during RX 
+
+    # Default time [s] listen() waits for a frame to START (preamble detected) when no timeout is given.
+    # It does NOT need to include the frame's air time: once a preamble is detected, listen() automatically
+    # extends its deadline so the frame can finish (see listen() and frame_duration()).
+    # Choose it from your protocol: at least the time the other device needs before it starts sending
+    # (e.g. its reply delay), plus a few ms for Python/OS scheduling jitter.
+    # It is read at call time, so you can change it:
+    #   - for all devices:   DW1000.DEFAULT_LISTEN_TIMEOUT = 0.05
+    #   - for one device:    dw.DEFAULT_LISTEN_TIMEOUT = 0.05
+    #   - for one call:      dw.listen(timeout=0.05)
+    DEFAULT_LISTEN_TIMEOUT = 0.015
+    DW_LISTEN_TIMEOUT = DEFAULT_LISTEN_TIMEOUT  # Deprecated alias, kept for backwards compatibility
+    # Extra time added on top of the computed frame air time when extending a listen() deadline
+    LISTEN_FRAME_MARGIN = 0.002
 
     def __init__(self, bus:int, cs:int, channel:Literal[1,2,3,4,5,7], PRF:Literal[16,64], bitrate:Literal[110,850,6,7],
                  preamble_length:Literal[64,128,256,512,1024,1536,2048,4096], preamble_code:int, 
@@ -377,23 +399,33 @@ class DW1000:
         """
         self.write_register([0x8D], [0, 1]) 
 
-    def packet_available(self)->bool: 
+    def packet_available(self)->bool:
         """
-        Checks if the DW1000 received a valid message. 
-       
-        RETURNS: 
-        - True if we did 
+        Checks if the DW1000 received a valid message.
+
+        RETURNS:
+        - True if we did
         - False if we didn't
             - NOTE: DW1000 stays in RX mode in this case. If an RX error or timeout occurred, RX is reset
               (light RX-only reset, required by the manual p.31) and re-enabled, which clears the error bits.
         """
-        status = self.read_register([0x0F], 5, return_ints=True) # SYS_STATUS 0x0F 
-        bits8_23 = status[1] | status[2]<<8 # putting it into 16bit format for ease of comparison 
-        # Good frames have: RXFCG, RXDFR, RXPHD, LDEDONE, RXSFDD and RXPRD set  
-        if (bits8_23 & 0x006F)==0x006F: # Good frame 
-            return True 
-        # Either received a bad frame or nothing 
-        else: 
+        return self._poll_rx()[0]
+
+    def _poll_rx(self)->tuple[bool, bool]:
+        """
+        Reads SYS_STATUS once and handles RX errors (see packet_available()).
+
+        RETURNS:
+        - (good_frame, preamble_detected). preamble_detected is the RXPRD bit (SYS_STATUS bit 8): a frame is
+          currently being received (or was just received). It is False after an RX error/timeout reset.
+        """
+        status = self.read_register([0x0F], 5, return_ints=True) # SYS_STATUS 0x0F
+        bits8_23 = status[1] | status[2]<<8 # putting it into 16bit format for ease of comparison
+        # Good frames have: RXFCG, RXDFR, RXPHD, LDEDONE, RXSFDD and RXPRD set
+        if (bits8_23 & 0x006F)==0x006F: # Good frame
+            return True, True
+        # Either received a bad frame or nothing
+        else:
             # Bottom of p.31 in manual indicates we should reset RX after error or timeout event 
             # If any of RXPHE, RXFCE, RXRFSL, RXRFTO, LDEERR, RXSFDTO, , RXPTO are true, we soft reset RX and exit 
             err_or_to_mask = 0x04<<24 | 0x27<<16 | 0x90<<8 # aforementioned error/TO bits 
@@ -405,8 +437,9 @@ class DW1000:
                 # Re-enabling RX again, we'll keep looping if there's time left.
                 # This also clears the latched RX status/error bits (see enable_rx()).
                 self.enable_rx()
-            # If we didn't get anything, DW1000 stays in RX mode 
-            return False 
+                return False, False
+            # If we didn't get anything, DW1000 stays in RX mode
+            return False, bool(status[1] & 0x01)  # RXPRD: preamble detected, frame in progress
 
     @overload
     def receive_packet(self, return_ints:Literal[True]=...)->tuple[list[int]|None, int|None]: ...
@@ -445,17 +478,17 @@ class DW1000:
         return data, rx_stamp
 
     @overload
-    def listen(self, ranging:Literal[False]=..., timeout:float=..., return_ints:Literal[True]=...)->list[int]|None: ...
+    def listen(self, ranging:Literal[False]=..., timeout:float|None=..., return_ints:Literal[True]=...)->list[int]|None: ...
     @overload
-    def listen(self, ranging:Literal[False]=..., timeout:float=..., *, return_ints:Literal[False])->list[str]|None: ...
+    def listen(self, ranging:Literal[False]=..., timeout:float|None=..., *, return_ints:Literal[False])->list[str]|None: ...
     @overload
-    def listen(self, ranging:Literal[True], timeout:float=..., return_ints:Literal[True]=...)->tuple[list[int]|None, int|None]: ...
+    def listen(self, ranging:Literal[True], timeout:float|None=..., return_ints:Literal[True]=...)->tuple[list[int]|None, int|None]: ...
     @overload
-    def listen(self, ranging:Literal[True], timeout:float=..., *, return_ints:Literal[False])->tuple[list[str]|None, int|None]: ...
+    def listen(self, ranging:Literal[True], timeout:float|None=..., *, return_ints:Literal[False])->tuple[list[str]|None, int|None]: ...
     @overload
-    def listen(self, ranging:bool=..., timeout:float=..., return_ints:bool=...)->list[int]|list[str]|None|tuple[list[int]|list[str]|None, int|None]: ...
+    def listen(self, ranging:bool=..., timeout:float|None=..., return_ints:bool=...)->list[int]|list[str]|None|tuple[list[int]|list[str]|None, int|None]: ...
 
-    def listen(self, ranging:bool=False, timeout:float=DW_LISTEN_TIMEOUT, return_ints:bool=True)->list[int]|list[str]|None|tuple[list[int]|list[str]|None, int|None]:
+    def listen(self, ranging:bool=False, timeout:float|None=None, return_ints:bool=True)->list[int]|list[str]|None|tuple[list[int]|list[str]|None, int|None]:
         """
         Sets the DW1000 to RX mode and listens for messages.
         Returns the first message found, if any, then disables RX (the DW1000 goes back to IDLE; the SPI
@@ -463,24 +496,71 @@ class DW1000:
 
         ARGS:
             - ranging: If we are ranging, will return the RX timestamp too (reg 0x15)
-            - timeout: Max amount of time [s] to stay listening
+            - timeout: Max time [s] to wait for a frame to START (preamble detected). None uses
+              DEFAULT_LISTEN_TIMEOUT (see the note on that attribute for how to choose and set it).
+              If a preamble is detected before the timeout, listening continues until that frame has had
+              time to finish (frame_duration() of a max-size frame + LISTEN_FRAME_MARGIN), so frames are not
+              cut off at the end of the window. listen() can therefore take up to timeout + one frame's air time.
             - return_ints: Whether to return in hex string format or pure ints
         RETURNS:
             - ranging False: the data received as a list of bytes, or None if nothing was received in time
             - ranging True: (data, rx_timestamp), rx_timestamp being in CLK TICKS (raw 40bit value);
               (None, None) if nothing was received in time
         """
-        data = None 
-        rx_stamp = None 
+        if timeout is None:
+            timeout = self.DEFAULT_LISTEN_TIMEOUT  # read at call time, so it can be changed after creation
+        frame_window = self.frame_duration() + self.LISTEN_FRAME_MARGIN  # time for a max-size frame to finish
+        data = None
+        rx_stamp = None
 
-        self.enable_rx()  # automatically clears any past latched receive bits 
-        start = time.perf_counter() 
-        while (time.perf_counter()-start)<timeout: 
-            if self.packet_available(): 
-                data, rx_stamp = self.receive_packet(return_ints=return_ints) 
-                break 
-        self.disable_rx_tx()  
-        return (data, rx_stamp) if ranging else data 
+        self.enable_rx()  # automatically clears any past latched receive bits
+        start = time.perf_counter()
+        wait_end = start + timeout   # frames must start before this
+        deadline = wait_end          # extended when a frame starts
+        while (now := time.perf_counter()) < deadline:
+            good_frame, preamble_detected = self._poll_rx()
+            if good_frame:
+                data, rx_stamp = self.receive_packet(return_ints=return_ints)
+                break
+            # A frame started within the waiting window: give it time to finish. Frames detected after the
+            # window (e.g. after an RX error during an extension) do not extend it, so the total is bounded.
+            if preamble_detected and now <= wait_end:
+                deadline = max(deadline, now + frame_window)
+        self.disable_rx_tx()
+        return (data, rx_stamp) if ranging else data
+
+    def frame_duration(self, n_bytes:int=125)->float:
+        """
+        Approximate on-air duration [s] of one frame with the current UWB configuration:
+        preamble + SFD + PHY header + data (n_bytes + 2 CRC octets, with Reed-Solomon parity bits).
+        Useful for choosing timeouts and reply delays (e.g. in ranging).
+
+        Approximate examples: 6.8 Mbps / 128 preamble / 125 bytes: ~0.3 ms; 110 kbps / 4096 preamble /
+        125 bytes: ~14.3 ms.
+
+        ARGS:
+            - n_bytes: number of data bytes in the frame (0 to 125, as passed to transmit()). Default: the maximum.
+        RAISES:
+            - ValueError if n_bytes is out of range
+            - RuntimeError if config_uwb_settings() has not been applied yet
+        """
+        if not isinstance(n_bytes, int) or not 0 <= n_bytes <= 125:
+            raise ValueError(f"n_bytes must be an int between 0 and 125, got {n_bytes!r}")
+        if self._uwb_config is None:
+            raise RuntimeError("frame_duration() needs a UWB configuration (config_uwb_settings() not applied yet)")
+        PRF = self._uwb_config["PRF"]
+        bitrate = self._uwb_config["bitrate"]
+        bitrate = bitrate if bitrate in (110, 850) else 6.8  # 6, 7 and 6.8 all mean 6.8 Mbps
+        preamble_length = self._uwb_config["preamble_length"]
+
+        symbol = _PREAMBLE_SYMBOL_S[PRF]
+        sfd_symbols = 64 if bitrate == 110 else 8                        # SFD length (manual p.201)
+        phr_bit = _DATA_BIT_S[110] if bitrate == 110 else _DATA_BIT_S[850]  # PHR sent at 850 kbps unless at 110 kbps
+        data_bits = 8 * (n_bytes + 2)                                    # + 2 CRC octets
+        data_bits += _RS_PARITY_BITS * -(-data_bits // _RS_BLOCK_BITS)   # Reed-Solomon parity (ceil division)
+        return ((preamble_length + sfd_symbols) * symbol
+                + _PHR_BITS * phr_bit
+                + data_bits * _DATA_BIT_S[bitrate])
     
     @staticmethod
     def check_valid_uwb_config(channel:int, PRF:int, bitrate:float, preamble_length:int, preamble_code:int, smart_tx_power:bool)->bool: 
