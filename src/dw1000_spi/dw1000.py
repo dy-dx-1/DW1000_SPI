@@ -108,7 +108,7 @@ class DW1000:
             print("DW1000 did not return the correct ID. Is it plugged in correctly?")
             print(f"Expected ID: ['0xde', '0xca', '0x1', '0x30'], got {d_id}")
             self.close() 
-            quit() 
+            raise RuntimeError("Could not validate DW1000 connection")
         
         ## Checking CLK PLL locked and device completed INIT mode 
         cfg = self.read_register([0x0F], 5) 
@@ -117,7 +117,7 @@ class DW1000:
         if not (cplock and slp2init): 
             print("[ERROR] DW1000 did not lock CLK PLL and/or did not reach INIT successfully. Try replugging it?")
             self.close() 
-            quit() 
+            raise RuntimeError("Could not validate DW1000 connection")
 
         ## Loading LDE microcode as per steps in p.22 of user manual 
         self.write_register([0xF6, 0x00], [0x01, 0x03])
@@ -161,7 +161,6 @@ class DW1000:
         """ 
         Converts a hex string into the equivalent octet binary string 
         """
-        # TODO: add <0xFF checks 
         return f"{int(hex_str, base=16):08b}"
     
     def read_register(self, header:list, length:int, reverse:bool=False, return_ints:bool=False)->list[str|int]: 
